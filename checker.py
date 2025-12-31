@@ -22,7 +22,7 @@ from enum import Enum, auto
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
-from typing import Any, Dict, Final, List, Optional
+from typing import Any, Dict, Final, List, Optional, Deque
 
 # Platform setup
 if sys.platform == "win32":
@@ -337,7 +337,7 @@ class Stats:
         self.errors = 0
         self.start_time = time.time()
         self._lock = Lock()
-        self._durations: deque = deque(maxlen=50)
+        self._durations: Deque[float] = deque(maxlen=50)
 
     def add(self, duration: float = 0.0) -> int:
         with self._lock:
@@ -721,9 +721,6 @@ def check_account(browser: Browser, account: Account) -> Result:
         if ready.get('ready'):
             break
         time.sleep(0.25)
-    else:
-        # Page didn't become ready, but continue anyway
-        pass
     
     time.sleep(0.2)
     
@@ -753,9 +750,9 @@ def check_account(browser: Browser, account: Account) -> Result:
     browser.js(JS_CLICK_CAPTCHA)
     time.sleep(0.3)
     
-    # Wait for captcha to auto-solve (reduced from 40 to 25 iterations, adaptive timing)
+    # Wait for captcha to auto-solve (time-based polling, max 5 seconds)
     captcha_solved = False
-    max_captcha_wait = 5.0  # Max 5 seconds instead of 8
+    max_captcha_wait = 5.0
     captcha_start = time.time()
     poll_count = 0
     while time.time() - captcha_start < max_captcha_wait:
