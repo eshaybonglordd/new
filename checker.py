@@ -15,13 +15,14 @@ import signal
 import sys
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
-from typing import Any, Dict, Final, List, Optional
+from typing import Any, Dict, Final, List, Optional, Deque
 
 # Platform setup
 if sys.platform == "win32":
@@ -336,15 +337,13 @@ class Stats:
         self.errors = 0
         self.start_time = time.time()
         self._lock = Lock()
-        self._durations: List[float] = []
+        self._durations: Deque[float] = deque(maxlen=50)
 
     def add(self, duration: float = 0.0) -> int:
         with self._lock:
             self.processed += 1
             if duration > 0:
                 self._durations.append(duration)
-                if len(self._durations) > 50:
-                    self._durations = self._durations[-50:]
             return self.processed
 
     def hit(self):
@@ -585,9 +584,14 @@ class Results:
             return 0
         try:
             p = Path(src)
-            lines = p.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+            # Read all lines at once for better performance
+            content = p.read_text(encoding="utf-8", errors="ignore")
+            lines = content.splitlines(keepends=True)
             failed_set = set(self._failed)
-            new_lines, removed = [], 0
+            
+            # Filter lines in memory
+            new_lines = []
+            removed = 0
             for ln in lines:
                 part = ln.split("|")[0].strip()
                 if ":" in part:
@@ -596,7 +600,10 @@ class Results:
                         removed += 1
                         continue
                 new_lines.append(ln)
-            p.write_text("".join(new_lines), encoding="utf-8")
+            
+            # Write back only if changes were made
+            if removed > 0:
+                p.write_text("".join(new_lines), encoding="utf-8")
             return removed
         except:
             return 0
@@ -708,7 +715,8 @@ def check_account(browser: Browser, account: Account) -> Result:
     time.sleep(0.2)
     
     # Wait for page ready (fast)
-    for _ in range(10):
+    max_ready_attempts = 10
+    for attempt in range(max_ready_attempts):
         ready = norm(browser.js(JS_PAGE_READY))
         if ready.get('ready'):
             break
@@ -742,15 +750,19 @@ def check_account(browser: Browser, account: Account) -> Result:
     browser.js(JS_CLICK_CAPTCHA)
     time.sleep(0.3)
     
-    # Wait for captcha to auto-solve (up to 8 seconds)
+    # Wait for captcha to auto-solve (time-based polling, max 5 seconds)
     captcha_solved = False
-    for _ in range(40):
+    max_captcha_wait = 5.0
+    captcha_start = time.time()
+    poll_count = 0
+    while time.time() - captcha_start < max_captcha_wait:
         cap = norm(browser.js(JS_CHECK_CAPTCHA))
         if cap.get('solved'):
             captcha_solved = True
             break
-        # Keep clicking if not solving
-        if _ % 10 == 5:
+        # Re-click captcha every 5th poll
+        poll_count += 1
+        if poll_count % 5 == 0:
             browser.js(JS_CLICK_CAPTCHA)
         time.sleep(0.2)
     
@@ -762,13 +774,14 @@ def check_account(browser: Browser, account: Account) -> Result:
     time.sleep(0.4)
     
     # Handle captcha error after submit (retry if needed)
-    for retry in range(3):
+    for retry in range(2):  # Reduced from 3 to 2 retries
         err = norm(browser.js("""(function(){return{captchaErr:(document.body?.innerText||'').toLowerCase().includes('captcha')}})()"""))
         if not err.get('captchaErr'):
             break
-        # Click captcha and wait for solve
+        # Click captcha and wait for solve (reduced timeout)
         browser.js(JS_CLICK_CAPTCHA)
-        for _ in range(30):
+        retry_start = time.time()
+        while time.time() - retry_start < 3.0:  # Max 3 seconds instead of 4.5
             time.sleep(0.15)
             cap = norm(browser.js(JS_CHECK_CAPTCHA))
             if cap.get('solved'):
@@ -791,21 +804,22 @@ def check_account(browser: Browser, account: Account) -> Result:
         # Success
         if state.get("loggedIn"):
             stats = {}
-            for _ in range(10):
-                time.sleep(0.3)
+            # Reduced from 10 to 6 attempts with faster polling
+            for attempt in range(6):
+                time.sleep(0.25)  # Reduced from 0.3 to 0.25
                 stats = norm(browser.js(JS_EXTRACT_STATS))
                 if stats.get("username", "?") != "?" and stats.get("level", "0") != "0":
                     break
             
-            # Fetch full profile data from API for marketplace value, banned status, etc.
+            # Fetch full profile data from API - reduced retries from 3 to 2
             userId = stats.get("userId", "")
             api_data = {}
             if userId:
-                for _ in range(3):
+                for _ in range(2):  # Reduced from 3 to 2
                     api_data = norm(browser.js(f"{JS_FETCH_PROFILE}('{userId}')"))
                     if api_data.get("success"):
                         break
-                    time.sleep(0.3)
+                    time.sleep(0.25)  # Reduced from 0.3 to 0.25
             
             # Merge API data with DOM data (API is more accurate)
             if api_data.get("success"):
@@ -852,13 +866,14 @@ def check_account(browser: Browser, account: Account) -> Result:
         if state.get("rateLimited"):
             return Result(account, Status.RATE_LIMITED, error="Rate limited", duration=time.time()-start)
         
-        # Captcha needs click - click it and wait for solve, then submit
+        # Captcha needs click - click it and wait for solve, then submit (optimized)
         if (state.get("captchaNeedsClick") or state.get("hasCaptcha") and not state.get("captchaSolved")):
             if time.time() - last_captcha_click > 2.0:
                 browser.js(JS_CLICK_CAPTCHA)
                 last_captcha_click = time.time()
-                # Wait for solve
-                for _ in range(25):
+                # Reduced from 25 to 15 iterations with faster timing
+                captcha_wait_start = time.time()
+                while time.time() - captcha_wait_start < 2.5:  # Max 2.5 seconds
                     time.sleep(0.15)
                     chk = norm(browser.js(JS_CHECK_CAPTCHA))
                     if chk.get("solved"):
